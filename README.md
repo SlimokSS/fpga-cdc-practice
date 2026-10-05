@@ -1,221 +1,114 @@
-# CDC Practice — Asynchronous FIFO
+# FPGA CDC Practice
 
-Учебный проект по Clock Domain Crossing (CDC) на SystemVerilog.
+Этот репозиторий я сделал для практики Clock Domain Crossing (CDC) в SystemVerilog.
 
-Цель проекта — разобраться не только в RTL-реализации asynchronous FIFO, но и в том, что происходит после синтеза: metastability, synchronizer chains, Gray-code pointers, dual-clock RAM, reset CDC, MTBF analysis и физические timing constraints в Intel Quartus TimeQuest.
+Основная цель была не просто написать работающий RTL, а разобраться, что реально происходит при передаче сигналов между независимыми тактовыми доменами: откуда берётся metastability, почему обычных двух триггеров хватает не всегда, зачем нужен Gray code, как работает REQ/ACK handshake и как всё это потом проверять в Quartus.
 
-Проект реализован для FPGA:
+Сейчас в проекте есть две основные части:
 
-- Intel Cyclone IV E
-- EP4CE6F17C8N
-- Quartus Prime Lite 21.1
+- асинхронный FIFO;
+- синхронизатор событий через REQ/ACK handshake.
+
+Для симуляции использовал Icarus Verilog, для синтеза и анализа CDC — Intel Quartus Prime Lite 21.1.
 
 ## Структура проекта
 
 ```text
 CDC/
-├── README.md
 ├── constraints/
-│   └── async_fifo.sdc
+│   ├── async_fifo.sdc
+│   └── pulse_sync.sdc
+│
 ├── rtl/
-│   └── async_fifo.sv
-└── tb/
-    └── tb_async_fifo.sv
+│   ├── async_fifo.sv
+│   └── pulse_sync.sv
+│
+├── tb/
+│   ├── tb_async_fifo.sv
+│   └── tb_pulse_sync.sv
+│
+└── README.md
 ```
 
-## Основные параметры
+# Асинхронный FIFO
 
-В текущей конфигурации FIFO используется:
+Первой большой задачей был асинхронный FIFO, который передаёт данные между двумя независимыми clock domain.
 
-```text
-DATA WIDTH = 8 bit
-DEPTH      = 16
-clk_wr     = 50 MHz / 20 ns
-clk_rd     = 40 MHz / 25 ns
-```
-
-Write и read части работают в независимых clock domains.
-
-Интерфейс построен в стиле ready/valid.
-
-Write side:
-
-```text
-s_data
-s_valid
-s_ready
-```
-
-Read side:
-
-```text
-m_data
-m_valid
-m_ready
-```
-
-Передача происходит только при handshake:
-
-```text
-wr_fire = s_valid && s_ready
-rd_fire = m_valid && m_ready
-```
-
----
-
-# Архитектура asynchronous FIFO
-
-В synchronous FIFO можно было бы использовать общий `count`.
-
-В asynchronous FIFO это невозможно сделать напрямую, потому что запись и чтение происходят от разных clocks.
-
-Поэтому FIFO использует два независимых pointer:
-
-```text
-wr_bin
-rd_bin
-```
-
-Binary pointers используются для:
-
-- адресации RAM;
-- локального инкремента;
-- вычисления следующего pointer.
-
-Для передачи состояния pointer между clock domains binary pointer преобразуется в Gray code:
-
-```systemverilog
-gray = binary ^ (binary >> 1);
-```
-
-Используются:
-
-```text
-wr_gray
-rd_gray
-```
-
-Главное свойство Gray code:
-
-> между двумя соседними значениями изменяется только один бит.
-
-Это делает Gray code удобным для передачи счетчиков между асинхронными clock domains.
-
----
-
-# Pointer width
-
-При:
+Во время тестирования использовал:
 
 ```text
 DEPTH = 16
+WIDTH = 8
 ```
 
-адресная ширина равна:
+Для адресации памяти используются обычные binary pointers, а между clock domain передаются Gray pointers.
+
+Указатели имеют дополнительный бит:
+
+```text
+ADDR_W = $clog2(DEPTH)
+
+wr_bin  [ADDR_W:0]
+rd_bin  [ADDR_W:0]
+wr_gray [ADDR_W:0]
+rd_gray [ADDR_W:0]
+```
+
+Дополнительный бит нужен для определения wrap-around и состояния `full`.
+
+## Binary и Gray pointers
+
+Следующий binary pointer вычисляется только при реальной транзакции:
 
 ```systemverilog
-ADDR_W = $clog2(DEPTH);
-```
-
-То есть:
-
-```text
-ADDR_W = 4
-```
-
-Но сами pointers имеют ширину:
-
-```text
-ADDR_W + 1 = 5 bit
-```
-
-Дополнительный старший бит используется для определения wrap-around.
-
-RAM адресуется только младшими битами:
-
-```systemverilog
-wr_bin[ADDR_W-1:0]
-rd_bin[ADDR_W-1:0]
-```
-
-Для `DEPTH = 16` это:
-
-```text
-wr_bin[3:0]
-rd_bin[3:0]
-```
-
-Пятый бит в адрес RAM не идет.
-
----
-
-# Gray-code pointer crossing
-
-Write pointer передается из `clk_wr` domain в `clk_rd` domain:
-
-```text
-wr_gray
-   |
-   v
-wr_gray_sync1
-   |
-   v
-wr_gray_sync2
-```
-
-Read pointer передается в обратном направлении:
-
-```text
-rd_gray
-   |
-   v
-rd_gray_sync1
-   |
-   v
-rd_gray_sync2
-```
-
-Для каждого Gray bit используется двухступенчатый synchronizer.
-
-Первый FF может попасть в metastability.
-
-Второй FF дает первому дополнительное время для выхода из metastable state перед использованием значения остальной логикой.
-
----
-
-# Empty detection
-
-Флаг `empty` формируется только внутри read domain.
-
-Используется следующий read pointer:
-
-```systemverilog
+wr_bin_next = wr_bin + wr_fire;
 rd_bin_next = rd_bin + rd_fire;
+```
+
+После этого binary значение переводится в Gray code:
+
+```systemverilog
+wr_gray_next = wr_bin_next ^ (wr_bin_next >> 1);
 rd_gray_next = rd_bin_next ^ (rd_bin_next >> 1);
 ```
 
-FIFO считается пустым, если следующий read pointer совпадает с синхронизированным write pointer:
+Gray code используется потому, что между соседними значениями меняется только один бит. Это сильно удобнее для CDC, чем передавать обычный binary counter, где одновременно могут переключаться несколько бит.
+
+## Синхронизация указателей
+
+Write pointer передаётся в read domain через двухтриггерный synchronizer:
+
+```text
+wr_gray
+   ↓
+wr_gray_sync1
+   ↓
+wr_gray_sync2
+```
+
+Read pointer аналогично передаётся в write domain:
+
+```text
+rd_gray
+   ↓
+rd_gray_sync1
+   ↓
+rd_gray_sync2
+```
+
+В каждом домене используется только уже синхронизированное значение указателя из другого домена.
+
+## Empty
+
+FIFO считается пустым, когда следующий read pointer совпадает с синхронизированным write pointer:
 
 ```systemverilog
 empty_next = (rd_gray_next == wr_gray_sync2);
 ```
 
-Таким образом read-side логика никогда напрямую не использует asynchronous `wr_gray`.
+## Full
 
----
-
-# Full detection
-
-Флаг `full` формируется только внутри write domain.
-
-Следующий write pointer:
-
-```systemverilog
-wr_bin_next = wr_bin + wr_fire;
-wr_gray_next = wr_bin_next ^ (wr_bin_next >> 1);
-```
-
-Для определения состояния `full` следующий write Gray pointer сравнивается с синхронизированным read Gray pointer, у которого инвертированы два старших бита:
+Для определения `full` используется сравнение следующего write Gray pointer с синхронизированным read Gray pointer с инверсией двух старших битов:
 
 ```systemverilog
 full_next =
@@ -224,308 +117,120 @@ full_next =
           rd_gray_sync2[ADDR_W-2:0]});
 ```
 
-Это позволяет определить ситуацию, когда write pointer находится на один полный оборот впереди read pointer.
+## Ready/valid
 
----
+На write стороне:
 
-# FIFO memory
+```text
+wr_fire = s_valid && s_ready
+```
 
-Память описана как:
+На read стороне:
+
+```text
+rd_fire = m_valid && m_ready
+```
+
+То есть указатели и память изменяются только когда транзакция реально произошла.
+
+## Память
+
+Память FIFO описана как массив:
 
 ```systemverilog
 logic [WIDTH-1:0] mem [0:DEPTH-1];
 ```
 
-Запись выполняется только в `clk_wr` domain:
+Quartus для FIFO 16x8 смог вывести её в embedded dual-port RAM.
 
-```systemverilog
-always_ff @(posedge clk_wr)
-    if (wr_fire)
-        mem[wr_bin[ADDR_W-1:0]] <= s_data;
-```
-
-Read address определяется текущим `rd_bin`.
-
-Quartus распознал память как dual-port RAM.
-
-Для:
+Получилось:
 
 ```text
-WIDTH = 8
-DEPTH = 16
+16 x 8 = 128 бит
 ```
 
-размер памяти составляет:
+Саму память я не сбрасываю reset'ом. Состояние FIFO определяется указателями и флагами `full/empty`, поэтому очищать все ячейки памяти нет необходимости.
 
-```text
-16 × 8 = 128 bit
-```
+## Reset CDC
 
-RAM специально не сбрасывается reset-сигналом.
+Внешний `rst_n` асинхронно устанавливает reset, но выход из reset происходит синхронно отдельно в каждом clock domain.
 
-После reset pointers возвращаются в начальное состояние, FIFO становится `empty`, поэтому старые данные внутри RAM считаются невалидными и не используются.
-
----
-
-# Reset CDC
-
-Внешний:
+Для write domain:
 
 ```text
 rst_n
-```
-
-является asynchronous относительно обоих clocks.
-
-Для каждого clock domain реализован отдельный reset synchronizer.
-
-Write domain:
-
-```text
-rst_n
-  |
-  v
+  ↓
 rst_n_wr1
-  |
-  v
+  ↓
 rst_n_wr
 ```
 
-Read domain:
+Для read domain:
 
 ```text
 rst_n
-  |
-  v
+  ↓
 rst_n_rd1
-  |
-  v
+  ↓
 rst_n_rd
 ```
 
-Используется принцип:
+Так логика не выходит из reset напрямую по асинхронному фронту.
+
+# Проверка async FIFO
+
+В testbench проверяются:
+
+- reset;
+- обычная запись;
+- обычное чтение;
+- заполнение FIFO;
+- состояние `full`;
+- опустошение FIFO;
+- состояние `empty`;
+- попытка записи при `full`;
+- попытка чтения при `empty`;
+- одновременная запись и чтение;
+- wrap-around указателей;
+- несколько полных циклов работы FIFO.
+
+Запуск симуляции:
+
+```powershell
+iverilog -g2012 -Wall -s tb_async_fifo -o simv rtl/async_fifo.sv tb/tb_async_fifo.sv
+vvp .\simv
+```
+
+# Async FIFO в Quartus
+
+После функциональной симуляции я отдельно проверял CDC уже в Quartus.
+
+Первые триггеры synchronizer chains были помечены через:
 
 ```text
-asynchronous assertion
-synchronous deassertion
+Synchronizer Identification = Forced If Asynchronous
 ```
 
-То есть reset включается сразу, независимо от clocks.
-
-Выход из reset происходит синхронно отдельно относительно `clk_wr` и `clk_rd`.
-
-Это уменьшает риск проблем при release reset около активного clock edge.
-
-Во время local reset интерфейс FIFO блокируется:
-
-```systemverilog
-s_ready = !full && rst_n_wr;
-m_valid = !empty && rst_n_rd;
-```
-
-Поэтому во время reset не происходит случайных read/write transactions.
-
----
-
-# Quartus Synchronizer Identification
-
-Quartus автоматически распознал synchronizer chains, но изначально не рассчитывал для них MTBF.
-
-Через Assignment Editor первые stages synchronizers были отмечены как:
+Для FIFO Quartus нашёл 12 synchronizer chains:
 
 ```text
-Synchronizer Identification
-Forced If Asynchronous
+5 бит rd_gray
+5 бит wr_gray
+1 reset synchronizer write domain
+1 reset synchronizer read domain
 ```
 
-Были отмечены:
-
-```text
-wr_gray_sync1[4:0]
-rd_gray_sync1[4:0]
-
-rst_n_wr1
-rst_n_rd1
-```
-
-Всего Quartus обнаружил:
-
-```text
-12 synchronizer chains
-```
-
-Из них:
-
-```text
-5 — wr_gray crossing
-5 — rd_gray crossing
-1 — write reset synchronizer
-1 — read reset synchronizer
-```
-
-После правильного Synchronizer Identification Quartus начал включать эти chains в metastability analysis.
-
-Для всех цепочек был получен результат:
+Для всех цепочек Quartus показал:
 
 ```text
 Typical MTBF > 1 Billion years
 ```
 
-MTBF здесь является статистической оценкой вероятности распространения metastability и не означает буквальный срок службы FPGA.
+## SDC для Gray bus
 
----
+Кроме обычных synchronizer FF, Gray bus нужно ещё правильно ограничить физически.
 
-# Gray bus physical timing constraints
-
-Gray code и 2FF synchronizer решают только часть CDC-проблемы.
-
-После Place & Route разные Gray bits могут иметь разные routing delays.
-
-Например, один Gray transition может идти настолько долго, что следующий transition по другому bit физически придет в destination domain раньше предыдущего.
-
-Поэтому Gray bus дополнительно ограничивается через SDC.
-
----
-
-## Выбор data pins synchronizer
-
-Если использовать весь register:
-
-```tcl
-[get_registers {*wr_gray_sync1*}]
-```
-
-Quartus может включить в анализ не только data input, но и:
-
-```text
-clock
-clear/reset
-other control pins
-```
-
-На практике это привело к тому, что `Report Max Skew` начал анализировать:
-
-```text
-rst_n -> clrn
-```
-
-вместо Gray data paths.
-
-Поэтому после анализа post-fit netlist используются конкретные data pins:
-
-```tcl
-set wr_gray_sync1_data \
-    [get_pins -hierarchical {*wr_gray_sync1*|d *wr_gray_sync1*|asdata}]
-
-set rd_gray_sync1_data \
-    [get_pins -hierarchical {*rd_gray_sync1*|d *rd_gray_sync1*|asdata}]
-```
-
-Quartus использовал как обычные `d` pins, так и `asdata`, поэтому в collection включены оба варианта.
-
-Для каждого synchronizer было найдено ровно 5 data pins.
-
----
-
-# Maximum delay
-
-Каждый отдельный Gray bit ограничивается одним source clock period.
-
-Для write pointer source clock:
-
-```text
-clk_wr = 20 ns
-```
-
-Используется:
-
-```tcl
-set_max_delay \
-    -from [get_clocks {clk_wr}] \
-    -to $wr_gray_sync1_data \
-    20.000
-```
-
-Для read pointer:
-
-```text
-clk_rd = 25 ns
-```
-
-Используется:
-
-```tcl
-set_max_delay \
-    -from [get_clocks {clk_rd}] \
-    -to $rd_gray_sync1_data \
-    25.000
-```
-
-TimeQuest показал 5 paths для каждого направления.
-
-Для `wr_gray`:
-
-```text
-Worst setup slack = 17.656 ns
-```
-
-При requirement:
-
-```text
-20.000 ns
-```
-
-получаем worst physical delay примерно:
-
-```text
-20.000 - 17.656 = 2.344 ns
-```
-
-Для `rd_gray`:
-
-```text
-Worst setup slack = 22.606 ns
-```
-
-При requirement:
-
-```text
-25.000 ns
-```
-
-worst delay составляет примерно:
-
-```text
-25.000 - 22.606 = 2.394 ns
-```
-
----
-
-# Minimum delay
-
-Обычный `set_false_path` использовать для этих Gray paths оказалось неудобно.
-
-После `set_false_path` Quartus переставал учитывать эти paths в `Report Max Skew`.
-
-Поэтому используется explicit minimum delay:
-
-```tcl
-set_min_delay \
-    -from [get_clocks {clk_wr}] \
-    -to $wr_gray_sync1_data \
-    0.000
-```
-
-и:
-
-```tcl
-set_min_delay \
-    -from [get_clocks {clk_rd}] \
-    -to $rd_gray_sync1_data \
-    0.000
-```
-
-В результате пути остаются внутри timing graph и могут одновременно участвовать в:
+Для этого в `async_fifo.sdc` используются:
 
 ```text
 set_max_delay
@@ -533,267 +238,324 @@ set_min_delay
 set_max_skew
 ```
 
----
-
-# Maximum skew
-
-Кроме абсолютной задержки каждого bit контролируется разброс задержек между Gray bits.
-
-Для write-side используется:
+Первые ступени synchronizer'ов выбираются именно по data pins:
 
 ```tcl
-set_max_skew \
-    -to $wr_gray_sync1_data \
-    -get_skew_value_from_clock_period src_clock_period \
-    -skew_value_multiplier 0.900
-```
-
-Source period:
-
-```text
-20 ns
-```
-
-Поэтому maximum allowed skew:
-
-```text
-0.9 × 20 ns = 18 ns
-```
-
-Для read-side:
-
-```tcl
-set_max_skew \
-    -to $rd_gray_sync1_data \
-    -get_skew_value_from_clock_period src_clock_period \
-    -skew_value_multiplier 0.900
-```
-
-Source period:
-
-```text
-25 ns
-```
-
-Maximum skew:
-
-```text
-0.9 × 25 ns = 22.5 ns
-```
-
----
-
-# Report Max Skew result
-
-Quartus обнаружил:
-
-```text
-20 paths
-0 violations
-```
-
-Для worst-case write-side pair:
-
-```text
-From Node      wr_gray[0]
-To Node        wr_gray_sync1[0]
-Launch Clock   clk_wr
-Latch Clock    clk_rd
-```
-
-и второй путь:
-
-```text
-From Node      wr_gray[2]
-To Node        wr_gray_sync1[2]
-Launch Clock   clk_wr
-Latch Clock    clk_rd
-```
-
-Результат:
-
-```text
-Required Skew = 18.000 ns
-Actual Skew   = 1.453 ns
-Slack         = 16.547 ns
-```
-
-Это подтверждает, что constraint применяется именно к Gray CDC data paths.
-
----
-
-# SDC
-
-Файл:
-
-```text
-constraints/async_fifo.sdc
-```
-
-содержит:
-
-```tcl
-create_clock -name clk_wr -period 20.000 [get_ports {clk_wr}]
-create_clock -name clk_rd -period 25.000 [get_ports {clk_rd}]
-
-derive_clock_uncertainty
-
 set wr_gray_sync1_data \
     [get_pins -hierarchical {*wr_gray_sync1*|d *wr_gray_sync1*|asdata}]
 
 set rd_gray_sync1_data \
     [get_pins -hierarchical {*rd_gray_sync1*|d *rd_gray_sync1*|asdata}]
-
-set_max_skew \
-    -to $wr_gray_sync1_data \
-    -get_skew_value_from_clock_period src_clock_period \
-    -skew_value_multiplier 0.900
-
-set_max_skew \
-    -to $rd_gray_sync1_data \
-    -get_skew_value_from_clock_period src_clock_period \
-    -skew_value_multiplier 0.900
-
-set_max_delay \
-    -from [get_clocks {clk_wr}] \
-    -to $wr_gray_sync1_data \
-    20.000
-
-set_max_delay \
-    -from [get_clocks {clk_rd}] \
-    -to $rd_gray_sync1_data \
-    25.000
-
-set_min_delay \
-    -from [get_clocks {clk_wr}] \
-    -to $wr_gray_sync1_data \
-    0.000
-
-set_min_delay \
-    -from [get_clocks {clk_rd}] \
-    -to $rd_gray_sync1_data \
-    0.000
 ```
 
----
+`set_max_delay` ограничивает максимальную задержку каждого Gray bit.
 
-# Testbench
+`set_min_delay` задаёт нижнюю границу задержки.
 
-Для FIFO написан self-checking testbench:
+`set_max_skew` ограничивает разброс задержек между битами Gray bus.
+
+В итоговом TimeQuest report нарушений не было.
+
+Для Gray bus получилось примерно:
 
 ```text
-tb/tb_async_fifo.sv
+write max delay worst slack: +17.656 ns
+read max delay worst slack:  +22.606 ns
+
+write min delay worst slack: +0.861 ns
+read min delay worst slack:  +0.864 ns
+
+actual max skew:    1.453 ns
+required max skew: 18.000 ns
+worst skew slack: +16.547 ns
 ```
 
-Testbench использует независимые clocks.
+Из этого задания я отдельно понял важную вещь: зелёный SDC report ещё не означает, что всё сделано правильно.
 
-В симуляции проверяются:
-
-- reset;
-- одиночная запись;
-- одиночное чтение;
-- сохранение порядка данных;
-- заполнение FIFO;
-- состояние `full`;
-- невозможность записи при `full`;
-- опустошение FIFO;
-- состояние `empty`;
-- невозможность чтения при `empty`;
-- одновременная запись и чтение;
-- работа при разных write/read frequencies;
-- многократный pointer wrap-around.
-
-В concurrent test writer и reader работают одновременно.
-
-Передается последовательность из 64 значений, поэтому pointers несколько раз проходят полный круг FIFO.
-
----
-
-# Simulation
-
-Для симуляции использовался Icarus Verilog.
-
-Запуск из корня проекта:
-
-```bash
-iverilog -g2012 -Wall -s tb_async_fifo -o simv rtl/async_fifo.sv tb/tb_async_fifo.sv
-vvp simv
-```
-
-При корректной работе testbench завершается без ошибок.
-
----
-
-# Что было изучено
-
-В рамках проекта были практически разобраны:
-
-- Clock Domain Crossing;
-- metastability;
-- двухступенчатые synchronizers;
-- Gray code;
-- asynchronous FIFO;
-- binary и Gray pointers;
-- extra wrap bit;
-- full/empty detection;
-- dual-clock RAM;
-- ready/valid handshake;
-- asynchronous reset assertion;
-- synchronous reset deassertion;
-- Quartus Synchronizer Identification;
-- MTBF analysis;
-- Quartus TimeQuest;
-- `set_max_delay`;
-- `set_min_delay`;
-- `set_max_skew`;
-- post-fit pins;
-- влияние physical routing на CDC;
-- проверка SDC через реальные timing reports.
-
----
-
-# Основной вывод
-
-Корректный CDC — это не только правильный SystemVerilog RTL.
-
-Нужно учитывать сразу несколько уровней:
+Нужно обязательно смотреть реальные:
 
 ```text
-RTL architecture
-        +
-Gray encoding
-        +
-synchronizers
-        +
-metastability
-        +
-reset strategy
-        +
-physical routing
-        +
-timing constraints
-        +
-post-fit analysis
-        +
-verification
-```
-
-Особенно важный практический вывод:
-
-> SDC constraint нельзя считать правильным только потому, что Quartus его принял и отчет зеленый.
-
-Нужно обязательно проверять:
-
-```text
-From Node
-To Node
+From
+To
 Launch Clock
 Latch Clock
-Actual Delay / Skew
-Required Delay / Skew
-Slack
 ```
 
-В ходе проекта несколько syntactically valid constraints сначала анализировали не те paths. Только после просмотра post-fit timing reports удалось убедиться, что TimeQuest действительно проверяет нужные Gray CDC connections.
+и проверять, что constraint попал именно на те physical paths, которые я хотел ограничить.
 
-Этот проект является практической основой для дальнейшего изучения CDC-схем: pulse synchronization, toggle synchronization, handshake CDC и других способов передачи информации между независимыми clock domains.
+# Pulse/Event CDC
+
+Следующая часть проекта — передача одиночных событий между разными clock domain.
+
+Первое, что стало понятно: обычный 2-FF synchronizer подходит для передачи стабильного level, но не гарантирует передачу короткого pulse.
+
+Если pulse появился и исчез между двумя фронтами destination clock, принимающий домен вообще может его не увидеть.
+
+## Toggle synchronizer
+
+Сначала я сделал классический toggle synchronizer.
+
+Каждое source событие меняет состояние одного бита:
+
+```text
+0 -> 1
+1 -> 0
+```
+
+Этот бит проходит через 2-FF synchronizer в destination domain.
+
+Дальше текущее значение сравнивается с предыдущим:
+
+```text
+toggle_sync2 XOR toggle_sync2_d
+```
+
+Если состояние изменилось, в destination domain появляется pulse длиной один такт.
+
+Это решает проблему короткого source pulse, но появляется другая проблема.
+
+Если два события произошли слишком быстро:
+
+```text
+0 -> 1 -> 0
+```
+
+и destination не успел увидеть промежуточное состояние `1`, то для него сигнал вообще не изменился.
+
+То есть простой toggle synchronizer не умеет гарантированно передавать несколько событий, которые идут слишком близко друг к другу.
+
+# REQ/ACK handshake
+
+Чтобы это исправить, я переделал передачу события в handshake с REQ и ACK.
+
+В source domain есть:
+
+```text
+req_toggle
+```
+
+REQ проходит в destination:
+
+```text
+req_toggle
+    ↓
+req_toggle_sync1
+    ↓
+req_toggle_sync2
+```
+
+В destination domain есть:
+
+```text
+ack_toggle
+```
+
+ACK возвращается обратно:
+
+```text
+ack_toggle
+    ↓
+ack_toggle_sync1
+    ↓
+ack_toggle_sync2
+```
+
+Source может принять новое событие только когда:
+
+```systemverilog
+src_ready = (req_toggle == ack_toggle_sync2);
+```
+
+Событие принимается при:
+
+```systemverilog
+event_src && src_ready
+```
+
+После этого `req_toggle` меняет состояние.
+
+Destination обнаруживает новый request через:
+
+```systemverilog
+req_toggle_sync2 != ack_toggle
+```
+
+В этот момент появляется:
+
+```text
+event_dst = 1
+```
+
+на один такт `clk_dst`.
+
+После обработки destination подтверждает событие:
+
+```systemverilog
+ack_toggle <= req_toggle_sync2;
+```
+
+После этого ACK проходит обратно через 2-FF synchronizer и `src_ready` снова становится единицей.
+
+Получается такой цикл:
+
+```text
+src_ready = 1
+      ↓
+source event
+      ↓
+REQ меняется
+      ↓
+src_ready = 0
+      ↓
+REQ проходит CDC
+      ↓
+event_dst
+      ↓
+ACK меняется
+      ↓
+ACK проходит CDC обратно
+      ↓
+src_ready = 1
+```
+
+Главное отличие от обычного toggle synchronizer — source теперь получает backpressure.
+
+Если предыдущий request ещё не обработан, новый request не принимается.
+
+При этом producer должен соблюдать handshake: если у него уже есть новое событие, а `src_ready = 0`, он должен дождаться готовности.
+
+# Проверка pulse_sync
+
+Для testbench использовал:
+
+```text
+clk_src:
+T = 14 ns
+f ≈ 71.43 MHz
+
+clk_dst:
+T = 50 ns
+f = 20 MHz
+```
+
+Проверяются:
+
+- reset;
+- состояние `src_ready` после reset;
+- обычная передача события;
+- несколько последовательных событий;
+- переключение REQ в обе стороны;
+- backpressure;
+- возврат ACK;
+- работа после повторного reset.
+
+Также проверяется ситуация, когда source хочет отправить несколько событий подряд.
+
+Второе событие ждёт возвращения `src_ready`, поэтому принятое событие уже не может потеряться внутри CDC.
+
+Запуск:
+
+```powershell
+iverilog -g2012 -Wall -s tb_pulse_sync -o simv rtl/pulse_sync.sv tb/tb_pulse_sync.sv
+vvp .\simv
+```
+
+Успешная симуляция заканчивается сообщением:
+
+```text
+tb_pulse_sync is finished
+```
+
+# Pulse sync в Quartus
+
+REQ и ACK synchronizer chains также были помечены через:
+
+```text
+Synchronizer Identification = Forced If Asynchronous
+```
+
+Quartus нашёл четыре synchronizer chains:
+
+```text
+req_toggle -> req_toggle_sync1 -> req_toggle_sync2
+
+ack_toggle -> ack_toggle_sync1 -> ack_toggle_sync2
+
+rst_n -> rst_n_src1 -> rst_n_src
+
+rst_n -> rst_n_dst1 -> rst_n_dst
+```
+
+Для всех четырёх:
+
+```text
+Typical MTBF > 1 Billion years
+```
+
+## REQ
+
+REQ идёт из быстрого clock domain в медленный:
+
+```text
+Source Clock:
+clk_src ≈ 71.43 MHz
+
+Synchronization Clock:
+clk_dst = 20 MHz
+
+Synchronization Registers:
+2
+
+Available Settling Time:
+97.864 ns
+
+Data Toggle Rate:
+8.929 million transitions/s
+```
+
+## ACK
+
+ACK идёт обратно из медленного clock domain в быстрый:
+
+```text
+Source Clock:
+clk_dst = 20 MHz
+
+Synchronization Clock:
+clk_src ≈ 71.43 MHz
+
+Synchronization Registers:
+2
+
+Available Settling Time:
+25.129 ns
+
+Data Toggle Rate:
+2.5 million transitions/s
+```
+
+У ACK settling time заметно меньше, потому что принимающий clock быстрее.
+
+При этом даже для ACK Quartus показывает MTBF больше одного миллиарда лет.
+
+# Что я вынес из этого проекта
+
+После этой практики CDC для меня перестал быть просто правилом "поставь два триггера".
+
+Основные вещи, которые я разобрал:
+
+- metastability нельзя полностью убрать, можно только сильно уменьшить вероятность её распространения;
+- 2-FF synchronizer подходит для single-bit level;
+- короткий pulse через обычный 2-FF synchronizer может полностью потеряться;
+- toggle synchronizer позволяет передать короткое событие;
+- два быстрых события могут схлопнуться в обычном toggle synchronizer;
+- REQ/ACK handshake гарантирует доставку принятого события;
+- backpressure является частью интерфейса;
+- multi-bit данные нельзя просто независимо синхронизировать по битам;
+- для потока multi-bit данных удобно использовать asynchronous FIFO;
+- Gray code хорошо подходит для передачи FIFO pointers;
+- reset тоже является CDC-проблемой;
+- asynchronous assert + synchronous deassert позволяет безопаснее работать с reset;
+- MTBF сильно зависит от available settling time;
+- constraints нужно проверять не только по наличию violations, но и по тому, какие реальные пути они ограничивают;
+- SDC, который успешно выполняется, всё равно может проверять вообще не те пути.
